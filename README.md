@@ -79,7 +79,7 @@
 
 |                                   | dora-rs                                                                                                                                                                                                     |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **APIs**                          | Python >= 3.7 including sync ⭐✅ <br> Rust ✅<br> C/C++ 🆗 <br>ROS2 >= Foxy 🆗                                                                                                                             |
+| **APIs**                          | Python >= 3.8 including sync ⭐✅ <br> Rust ✅<br> C/C++ 🆗 <br>ROS2 >= Foxy 🆗                                                                                                                             |
 | **OS**                            | Linux: Arm 32 ⭐✅ Arm 64 ⭐✅ x64_86 ⭐✅ <br>MacOS: Arm 64 ⭐✅ <br>Windows: x64_86 🆗 <br>WSL: x64_86 🆗 <br> Android: 🛠️ (Blocked by: https://github.com/elast0ny/shared_memory/issues/32) <br> IOS: 🛠️ |
 | **Message Format**                | Arrow ✅ <br> Standard Specification 🛠️                                                                                                                                                                     |
 | **Local Communication**           | Shared Memory ✅ <br> [Cuda IPC](https://arrow.apache.org/docs/python/api/cuda.html) 📐                                                                                                                     |
@@ -146,6 +146,12 @@ cargo install dora-cli
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dora-rs/dora/releases/latest/download/dora-cli-installer.sh | sh
 ```
 
+To install a specific version:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dora-rs/dora/main/install.sh | sh -s -- --tag v0.3.12
+```
+
 ### With Github release for Windows
 
 ```powershell
@@ -172,12 +178,11 @@ PATH=$PATH:$(pwd)/target/release
 uv venv --seed -p 3.11
 
 ## Install nodes dependencies of a remote graph
-dora build https://raw.githubusercontent.com/dora-rs/dora/refs/heads/main/examples/object-detection/yolo.yml --uv
+dora build https://raw.githubusercontent.com/dora-rs/dora/refs/heads/main/examples/python-dataflow/dataflow.yml --uv
 
 ## Run yolo graph
-dora run yolo.yml --uv
+dora run dataflow.yml --uv
 ```
-
 > Make sure to have a webcam
 
 To stop your dataflow, you can use <kbd>ctrl</kbd>+<kbd>c</kbd>
@@ -185,7 +190,7 @@ To stop your dataflow, you can use <kbd>ctrl</kbd>+<kbd>c</kbd>
 - To understand what is happening, you can look at the dataflow with:
 
 ```bash
-cat yolo.yml
+cat dataflow.yml
 ```
 
 - Resulting in:

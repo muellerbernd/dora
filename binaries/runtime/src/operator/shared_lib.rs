@@ -52,7 +52,19 @@ pub fn run(
     };
 
     let closure = AssertUnwindSafe(|| {
-        let bindings = Bindings::init(&library).context("failed to init operator")?;
+        let bindings = match Bindings::init(&library) {
+            Ok(b) => b,
+            Err(err) => {
+                let err = err.wrap_err(format!(
+                    "failed to init operator bindings from `{}`. \
+                        On Windows, ensure that the shared library exports the required symbols \
+                        (dora_init_operator, dora_drop_operator, dora_on_event).",
+                    path.display()
+                ));
+                let _ = init_done.send(Err(eyre!("{err:?}")));
+                return Err(err);
+            }
+        };
 
         let operator = SharedLibraryOperator {
             incoming_events,
@@ -172,7 +184,9 @@ impl SharedLibraryOperator<'_> {
 
                 let otel = metadata.open_telemetry_context();
                 let cx = deserialize_context(&otel);
-                span.set_parent(cx);
+                span.set_parent(cx)
+                    .context("failed to set parent span")
+                    .unwrap_or_default();
                 let cx = span.context();
                 let string_cx = serialize_context(&cx);
                 metadata.parameters.insert(

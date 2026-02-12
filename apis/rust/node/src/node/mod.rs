@@ -1,4 +1,11 @@
-use crate::{EventStream, daemon_connection::DaemonChannel};
+use crate::{
+    DaemonCommunicationWrapper, EventStream,
+    daemon_connection::{DaemonChannel, IntegrationTestingEvents},
+    integration_testing::{
+        TestingCommunication, TestingInput, TestingOptions, TestingOutput,
+        take_testing_communication,
+    },
+};
 
 use self::{
     arrow_utils::{copy_array_into_sample, required_data_size},
@@ -24,19 +31,20 @@ use dora_message::{
 use eyre::{WrapErr, bail};
 use is_terminal::IsTerminal;
 use shared_memory_extended::{Shmem, ShmemConf};
+
+use std::sync::Mutex;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     ops::{Deref, DerefMut},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
-use tokio::runtime::{Handle, Runtime};
-use tracing::{info, warn};
+use tokio::runtime::Handle;
 
-#[cfg(feature = "metrics")]
-use dora_metrics::run_metrics_monitor;
 #[cfg(feature = "tracing")]
-use dora_tracing::TracingBuilder;
+use dora_tracing::{OtelGuard, TracingBuilder};
+use tracing::{info, warn};
 
 pub mod arrow_utils;
 mod control_channel;
@@ -58,12 +66,6 @@ mod drop_stream;
 /// TCP.
 pub const ZERO_COPY_THRESHOLD: usize = 4096;
 
-#[allow(dead_code)]
-enum TokioRuntime {
-    Runtime(Runtime),
-    Handle(Handle),
-}
-
 /// Allows sending outputs and retrieving node information.
 ///
 /// The main purpose of this struct is to send outputs via Dora. There are also functions available
@@ -81,8 +83,6 @@ pub struct DoraNode {
 
     dataflow_descriptor: serde_yaml::Result<Descriptor>,
     warned_unknown_output: BTreeSet<DataId>,
-    _rt: TokioRuntime,
-
     interactive: bool,
 }
 
@@ -98,6 +98,14 @@ impl DoraNode {
     /// the initialization will fall back to [`init_interactive`](Self::init_interactive) if `stdin`
     /// is a terminal (detected through
     /// [`isatty`](https://www.man7.org/linux/man-pages/man3/isatty.3.html)).
+    ///
+    /// If the `DORA_NODE_CONFIG` environment variable is not set and `DORA_TEST_WITH_INPUTS` is
+    /// set, the node will be initialized in integration test mode. See the
+    /// [integration testing](crate::integration_testing) module for details.
+    ///
+    /// This function will also initialize the node in integration test mode when the
+    /// [`setup_integration_testing`](crate::integration_testing::setup_integration_testing)
+    /// function was called before. This takes precedence over all environment variables.
     ///
     /// ```no_run
     /// use dora_node_api::DoraNode;
@@ -118,32 +126,70 @@ impl DoraNode {
     }
 
     fn init_from_env_inner(fallback_to_interactive: bool) -> eyre::Result<(Self, EventStream)> {
-        let node_config: NodeConfig = match std::env::var("DORA_NODE_CONFIG") {
-            Ok(raw) => serde_yaml::from_str(&raw).context("failed to deserialize node config")?,
+        if let Some(testing_comm) = take_testing_communication() {
+            let TestingCommunication {
+                input,
+                output,
+                options,
+            } = *testing_comm;
+            return Self::init_testing(input, output, options);
+        }
+
+        // normal execution (started by dora daemon)
+        match std::env::var("DORA_NODE_CONFIG") {
+            Ok(raw) => {
+                let node_config: NodeConfig =
+                    serde_yaml::from_str(&raw).context("failed to deserialize node config")?;
+                return Self::init(node_config);
+            }
             Err(std::env::VarError::NotUnicode(_)) => {
                 bail!("DORA_NODE_CONFIG env variable is not valid unicode")
             }
-            Err(std::env::VarError::NotPresent) => {
-                if fallback_to_interactive && std::io::stdin().is_terminal() {
-                    println!(
-                    "{}",
-                    "Starting node in interactive mode as DORA_NODE_CONFIG env variable is not set"
-                        .green()
-                );
-                    return Self::init_interactive();
-                } else {
-                    bail!("DORA_NODE_CONFIG env variable is not set")
-                }
-            }
+            Err(std::env::VarError::NotPresent) => {} // continue trying other init methods
         };
-        #[cfg(feature = "tracing")]
-        {
-            TracingBuilder::new(node_config.node_id.as_ref())
-                .build()
-                .wrap_err("failed to set up tracing subscriber")?;
+
+        // node integration test mode
+        match std::env::var("DORA_TEST_WITH_INPUTS") {
+            Ok(raw) => {
+                let input_file = PathBuf::from(raw);
+                let output_file = match std::env::var("DORA_TEST_WRITE_OUTPUTS_TO") {
+                    Ok(raw) => PathBuf::from(raw),
+                    Err(std::env::VarError::NotUnicode(_)) => {
+                        bail!("DORA_TEST_WRITE_OUTPUTS_TO env variable is not valid unicode")
+                    }
+                    Err(std::env::VarError::NotPresent) => {
+                        input_file.with_file_name("outputs.jsonl")
+                    }
+                };
+                let skip_output_time_offsets =
+                    std::env::var_os("DORA_TEST_NO_OUTPUT_TIME_OFFSET").is_some();
+
+                let input = TestingInput::FromJsonFile(input_file);
+                let output = TestingOutput::ToFile(output_file);
+                let options = TestingOptions {
+                    skip_output_time_offsets,
+                };
+
+                return Self::init_testing(input, output, options);
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("DORA_TEST_WITH_INPUTS env variable is not valid unicode")
+            }
+            Err(std::env::VarError::NotPresent) => {} // continue trying other init methods
         }
 
-        Self::init(node_config)
+        // interactive mode
+        if fallback_to_interactive && std::io::stdin().is_terminal() {
+            println!(
+                "{}",
+                "Starting node in interactive mode as DORA_NODE_CONFIG env variable is not set"
+                    .green()
+            );
+            return Self::init_interactive();
+        }
+
+        // no run mode applicable
+        bail!("DORA_NODE_CONFIG env variable is not set")
     }
 
     /// Initiate a node from a dataflow id and a node id.
@@ -302,7 +348,7 @@ impl DoraNode {
         #[cfg(feature = "tracing")]
         {
             TracingBuilder::new("node")
-                .with_stdout("debug")
+                .with_stdout("debug", false)
                 .build()
                 .wrap_err("failed to set up tracing subscriber")?;
         }
@@ -314,11 +360,46 @@ impl DoraNode {
                 inputs: Default::default(),
                 outputs: Default::default(),
             },
-            daemon_communication: DaemonCommunication::Interactive,
+            daemon_communication: Some(DaemonCommunication::Interactive),
             dataflow_descriptor: serde_yaml::Value::Null,
             dynamic: false,
+            write_events_to: None,
         };
         let (mut node, events) = Self::init(node_config)?;
+        node.interactive = true;
+        Ok((node, events))
+    }
+
+    /// Initializes a node in integration test mode.
+    ///
+    /// No connection to a dora daemon is made in this mode. Instead, inputs are read from the
+    /// specified `TestingInput`, and outputs are written to the specified `TestingOutput`.
+    /// Additional options for the testing mode can be specified through `TestingOptions`.
+    ///
+    /// It is recommended to use this function only within test functions.
+    pub fn init_testing(
+        input: TestingInput,
+        output: TestingOutput,
+        options: TestingOptions,
+    ) -> eyre::Result<(Self, EventStream)> {
+        let node_config = NodeConfig {
+            dataflow_id: DataflowId::new_v4(),
+            node_id: "".parse()?,
+            run_config: NodeRunConfig {
+                inputs: Default::default(),
+                outputs: Default::default(),
+            },
+            daemon_communication: None,
+            dataflow_descriptor: serde_yaml::Value::Null,
+            dynamic: false,
+            write_events_to: None,
+        };
+        let testing_comm = TestingCommunication {
+            input,
+            output,
+            options,
+        };
+        let (mut node, events) = Self::init_with_options(node_config, Some(testing_comm))?;
         node.interactive = true;
         Ok((node, events))
     }
@@ -327,6 +408,14 @@ impl DoraNode {
     #[doc(hidden)]
     #[tracing::instrument]
     pub fn init(node_config: NodeConfig) -> eyre::Result<(Self, EventStream)> {
+        Self::init_with_options(node_config, None)
+    }
+
+    #[tracing::instrument(skip(testing_communication))]
+    fn init_with_options(
+        node_config: NodeConfig,
+        testing_communication: Option<TestingCommunication>,
+    ) -> eyre::Result<(Self, EventStream)> {
         let NodeConfig {
             dataflow_id,
             node_id,
@@ -334,37 +423,41 @@ impl DoraNode {
             daemon_communication,
             dataflow_descriptor,
             dynamic,
+            write_events_to,
         } = node_config;
         let clock = Arc::new(uhlc::HLC::default());
         let input_config = run_config.inputs.clone();
 
-        let rt = match Handle::try_current() {
-            Ok(handle) => TokioRuntime::Handle(handle),
-            Err(_) => TokioRuntime::Runtime(
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()
-                    .context("tokio runtime failed")?,
-            ),
-        };
-
-        #[cfg(feature = "metrics")]
-        {
-            let id = format!("{dataflow_id}/{node_id}");
-            let monitor_task = async move {
-                if let Err(e) = run_metrics_monitor(id.clone())
-                    .await
-                    .wrap_err("metrics monitor exited unexpectedly")
-                {
-                    warn!("metrics monitor failed: {:#?}", e);
+        let daemon_communication = match daemon_communication {
+            Some(comm) => comm.into(),
+            None => match testing_communication {
+                Some(comm) => {
+                    let TestingCommunication {
+                        input,
+                        output,
+                        options,
+                    } = comm;
+                    let (sender, mut receiver) = tokio::sync::mpsc::channel(5);
+                    let new_communication = DaemonCommunicationWrapper::Testing { channel: sender };
+                    let mut events = IntegrationTestingEvents::new(input, output, options)?;
+                    std::thread::spawn(move || {
+                        while let Some((request, reply_sender)) = receiver.blocking_recv() {
+                            let reply = events.request(&request);
+                            if reply_sender
+                                .send(reply.unwrap_or_else(|err| {
+                                    DaemonReply::Result(Err(format!("{err:?}")))
+                                }))
+                                .is_err()
+                            {
+                                eprintln!("failed to send reply");
+                            }
+                        }
+                    });
+                    new_communication
                 }
-            };
-            match &rt {
-                TokioRuntime::Runtime(rt) => rt.spawn(monitor_task),
-                TokioRuntime::Handle(handle) => handle.spawn(monitor_task),
-            };
-        }
+                None => eyre::bail!("no daemon communication method specified"),
+            },
+        };
 
         let event_stream = EventStream::init(
             dataflow_id,
@@ -372,6 +465,7 @@ impl DoraNode {
             &daemon_communication,
             input_config,
             clock.clone(),
+            write_events_to,
         )
         .wrap_err("failed to init event stream")?;
         let drop_stream =
@@ -380,7 +474,6 @@ impl DoraNode {
         let control_channel =
             ControlChannel::init(dataflow_id, &node_id, &daemon_communication, clock.clone())
                 .wrap_err("failed to init control channel")?;
-
         let node = Self {
             id: node_id,
             dataflow_id,
@@ -392,7 +485,6 @@ impl DoraNode {
             cache: VecDeque::new(),
             dataflow_descriptor: serde_yaml::from_value(dataflow_descriptor),
             warned_unknown_output: BTreeSet::new(),
-            _rt: rt,
             interactive: false,
         };
 
@@ -723,7 +815,6 @@ impl DoraNode {
 }
 
 impl Drop for DoraNode {
-    #[tracing::instrument(skip(self), fields(self.id = %self.id), level = "trace")]
     fn drop(&mut self) {
         // close all outputs first to notify subscribers as early as possible
         if let Err(err) = self
@@ -869,3 +960,58 @@ impl DerefMut for ShmemHandle {
 
 unsafe impl Send for ShmemHandle {}
 unsafe impl Sync for ShmemHandle {}
+
+/// Init Opentelemetry Tracing
+///
+/// This requires a tokio runtime spawning this function to be functional
+#[cfg(feature = "tracing")]
+pub fn init_tracing(
+    node_id: &NodeId,
+    dataflow_id: &DataflowId,
+) -> eyre::Result<Arc<Mutex<Option<OtelGuard>>>> {
+    let node_id_str = node_id.to_string();
+    let guard: Arc<Mutex<Option<OtelGuard>>> = Arc::new(Mutex::new(None));
+    let clone = guard.clone();
+    let tracing_monitor = async move {
+        let mut builder = TracingBuilder::new(node_id_str);
+        // Only enable OTLP if environment variable is set
+        if std::env::var("DORA_OTLP_ENDPOINT").is_ok()
+            || std::env::var("DORA_JAEGER_TRACING").is_ok()
+        {
+            builder = builder
+                .with_otlp_tracing()
+                .context("failed to set up OTLP tracing")
+                .unwrap()
+                .with_stdout("info", true);
+            *clone.lock().unwrap() = builder.guard.take();
+        } else {
+            builder = builder.with_stdout("info", true);
+        }
+
+        builder
+            .build()
+            .wrap_err("failed to set up tracing subscriber")
+            .unwrap();
+    };
+
+    let rt = Handle::try_current().context("failed to get tokio runtime handle")?;
+    rt.spawn(tracing_monitor);
+
+    #[cfg(feature = "metrics")]
+    {
+        let id = format!("{dataflow_id}/{node_id}");
+        let monitor_task = async move {
+            use dora_metrics::run_metrics_monitor;
+
+            if let Err(e) = run_metrics_monitor(id.clone())
+                .await
+                .wrap_err("metrics monitor exited unexpectedly")
+            {
+                warn!("metrics monitor failed: {:#?}", e);
+            }
+        };
+        let rt = Handle::try_current().context("failed to get tokio runtime handle")?;
+        rt.spawn(monitor_task);
+    };
+    Ok(guard)
+}

@@ -22,9 +22,10 @@ pub struct NodeConfig {
     pub dataflow_id: DataflowId,
     pub node_id: NodeId,
     pub run_config: NodeRunConfig,
-    pub daemon_communication: DaemonCommunication,
+    pub daemon_communication: Option<DaemonCommunication>,
     pub dataflow_descriptor: serde_yaml::Value,
     pub dynamic: bool,
+    pub write_events_to: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -72,6 +73,9 @@ pub enum NodeEvent {
     InputClosed {
         id: DataId,
     },
+    /// Notifies a node that all its inputs have been closed.
+    ///
+    /// This event is only sent to nodes that have at least one input.
     AllInputsClosed,
 }
 

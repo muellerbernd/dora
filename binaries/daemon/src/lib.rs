@@ -27,7 +27,7 @@ use dora_message::{
     },
     daemon_to_daemon::InterDaemonEvent,
     daemon_to_node::{DaemonReply, NodeConfig, NodeDropEvent, NodeEvent},
-    descriptor::NodeSource,
+    descriptor::{NodeSource, RestartPolicy},
     metadata::{self, ArrowTypeInfo},
     node_to_daemon::{DynamicNodeEvent, Timestamped},
 };
@@ -50,7 +50,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{self, AtomicBool, AtomicU32},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -71,6 +74,7 @@ pub use flume;
 pub use log::LogDestination;
 
 mod coordinator;
+mod extract_err_from_stderr;
 mod local_listener;
 mod log;
 mod node_communication;
@@ -83,9 +87,9 @@ use dora_tracing::telemetry::serialize_context;
 #[cfg(feature = "telemetry")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::pending::DataflowStatus;
+use crate::{extract_err_from_stderr::extract_err_from_stderr, pending::DataflowStatus};
 
-const STDERR_LOG_LINES: usize = 10;
+const STDERR_LOG_LINES_MAX: usize = 500;
 
 pub struct Daemon {
     running: HashMap<DataflowId, RunningDataflow>,
@@ -114,6 +118,8 @@ pub struct Daemon {
     sessions: BTreeMap<SessionId, BuildId>,
     builds: BTreeMap<BuildId, BuildInfo>,
     git_manager: GitManager,
+    /// System instance for metrics collection (reused across calls)
+    metrics_system: sysinfo::System,
 }
 
 type DaemonRunResult = BTreeMap<Uuid, BTreeMap<NodeId, Result<(), NodeError>>>;
@@ -188,6 +194,8 @@ impl Daemon {
         session_id: SessionId,
         uv: bool,
         log_destination: LogDestination,
+        write_events_to: Option<PathBuf>,
+        stop_after: Option<Duration>,
     ) -> eyre::Result<DataflowResult> {
         let working_dir = dataflow_path
             .canonicalize()
@@ -237,15 +245,38 @@ impl Daemon {
             nodes,
             dataflow_descriptor: descriptor,
             uv,
+            write_events_to,
         };
 
         let clock = Arc::new(HLC::default());
 
         let ctrlc_events = ReceiverStream::new(set_up_ctrlc_handler(clock.clone())?);
 
+        // Set up optional timeout for --stop-after
+        let timeout_events = if let Some(duration) = stop_after {
+            let clock = clock.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                tracing::info!("stop-after timeout reached ({duration:?}) -> stopping dataflow");
+                let _ = tx
+                    .send(Timestamped {
+                        inner: Event::StopAfter(duration),
+                        timestamp: clock.new_timestamp(),
+                    })
+                    .await;
+            });
+            ReceiverStream::new(rx)
+        } else {
+            // Create an empty stream that never emits events
+            ReceiverStream::new(tokio::sync::mpsc::channel(1).1)
+        };
+
+        let all_nodes_dynamic = spawn_command.nodes.values().all(|n| n.kind.dynamic());
         let exit_when_done = spawn_command
             .nodes
             .values()
+            .filter(|n| !n.kind.dynamic())
             .map(|n| (spawn_command.dataflow_id, n.id.clone()))
             .collect();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -259,7 +290,13 @@ impl Daemon {
                 timestamp,
             }
         });
-        let events = (coordinator_events, ctrlc_events, dynamic_node_events).merge();
+        let events = (
+            coordinator_events,
+            ctrlc_events,
+            timeout_events,
+            dynamic_node_events,
+        )
+            .merge();
         let run_result = Self::run_general(
             Box::pin(events),
             None,
@@ -293,12 +330,22 @@ impl Daemon {
 
         let (mut dataflow_results, ()) = future::try_join(run_result, spawn_result).await?;
 
+        let node_results = match dataflow_results.remove(&dataflow_id) {
+            Some(results) => results,
+            None if all_nodes_dynamic => {
+                // All nodes are dynamic - they don't send SpawnedNodeResult events,
+                // so there are no node results to report. This is expected and means success.
+                BTreeMap::new()
+            }
+            None => {
+                return Err(eyre::eyre!("no node results for dataflow_id {dataflow_id}"));
+            }
+        };
+
         Ok(DataflowResult {
             uuid: dataflow_id,
             timestamp: clock.new_timestamp(),
-            node_results: dataflow_results
-                .remove(&dataflow_id)
-                .context("no node results for dataflow_id")?,
+            node_results,
         })
     }
 
@@ -329,7 +376,8 @@ impl Daemon {
         let zenoh_session = open_zenoh_session(coordinator_addr.map(|addr| addr.ip()))
             .await
             .wrap_err("failed to open zenoh session")?;
-        let (dora_events_tx, dora_events_rx) = mpsc::channel(5);
+        // Use a large channel capacity to prevent deadlock
+        let (dora_events_tx, dora_events_rx) = mpsc::channel(1000);
         let daemon = Self {
             logger: Logger {
                 destination: log_destination,
@@ -352,6 +400,7 @@ impl Daemon {
             git_manager: Default::default(),
             builds,
             sessions: Default::default(),
+            metrics_system: sysinfo::System::new(),
         };
 
         let dora_events = ReceiverStream::new(dora_events_rx);
@@ -363,7 +412,23 @@ impl Daemon {
             inner: Event::HeartbeatInterval,
             timestamp: watchdog_clock.new_timestamp(),
         });
-        let events = (external_events, dora_events, watchdog_interval).merge();
+
+        let metrics_clock = daemon.clock.clone();
+        let metrics_interval = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
+            Duration::from_secs(2), // Collect metrics every 2 seconds
+        ))
+        .map(|_| Timestamped {
+            inner: Event::MetricsInterval,
+            timestamp: metrics_clock.new_timestamp(),
+        });
+
+        let events = (
+            external_events,
+            dora_events,
+            watchdog_interval,
+            metrics_interval,
+        )
+            .merge();
         daemon.run_inner(events).await
     }
 
@@ -421,21 +486,12 @@ impl Daemon {
                         }
                     }
                 }
+                Event::MetricsInterval => {
+                    self.collect_and_send_metrics().await?;
+                }
                 Event::CtrlC => {
                     tracing::info!("received ctrlc signal -> stopping all dataflows");
-                    for dataflow in self.running.values_mut() {
-                        let mut logger = self.logger.for_dataflow(dataflow.id);
-                        dataflow
-                            .stop_all(
-                                &mut self.coordinator_connection,
-                                &self.clock,
-                                None,
-                                false,
-                                &mut logger,
-                            )
-                            .await?;
-                    }
-                    self.exit_when_all_finished = true;
+                    self.trigger_manual_stop().await?;
                     if self.running.is_empty() {
                         break;
                     }
@@ -443,6 +499,13 @@ impl Daemon {
                 Event::SecondCtrlC => {
                     tracing::warn!("received second ctrlc signal -> exit immediately");
                     bail!("received second ctrl-c signal");
+                }
+                Event::StopAfter(duration) => {
+                    tracing::info!("stopping after {duration:?} as requested");
+                    self.trigger_manual_stop().await?;
+                    if self.running.is_empty() {
+                        break;
+                    }
                 }
                 Event::DaemonError(err) => {
                     tracing::error!("Daemon error: {err:?}");
@@ -567,6 +630,37 @@ impl Daemon {
         Ok(self.dataflow_node_results)
     }
 
+    async fn trigger_manual_stop(&mut self) -> eyre::Result<()> {
+        // Collect dataflow IDs that need immediate finishing
+        let mut dataflows_to_finish = Vec::new();
+
+        for dataflow in self.running.values_mut() {
+            let mut logger = self.logger.for_dataflow(dataflow.id);
+            let finish_when = dataflow
+                .stop_all(
+                    &mut self.coordinator_connection,
+                    &self.clock,
+                    None,
+                    false,
+                    &mut logger,
+                )
+                .await?;
+
+            // If stop_all returns Now, we need to finish this dataflow
+            if matches!(finish_when, FinishDataflowWhen::Now) {
+                dataflows_to_finish.push(dataflow.id);
+            }
+        }
+
+        // Finish dataflows after the loop to avoid borrow checker issues
+        for dataflow_id in dataflows_to_finish {
+            self.finish_dataflow(dataflow_id).await?;
+        }
+
+        self.exit_when_all_finished = true;
+        Ok(())
+    }
+
     async fn handle_coordinator_event(
         &mut self,
         event: DaemonCoordinatorEvent,
@@ -644,6 +738,7 @@ impl Daemon {
                 dataflow_descriptor,
                 spawn_nodes,
                 uv,
+                write_events_to,
             }) => {
                 match dataflow_descriptor.communication.remote {
                     dora_core::config::RemoteCommunicationConfig::Tcp => {}
@@ -660,6 +755,7 @@ impl Daemon {
                         dataflow_descriptor,
                         spawn_nodes,
                         uv,
+                        write_events_to,
                     )
                     .await;
                 let (trigger_result, result_task) = match result {
@@ -803,31 +899,42 @@ impl Daemon {
                 grace_duration,
                 force,
             } => {
-                let mut logger = self.logger.for_dataflow(dataflow_id);
-                let dataflow = self
-                    .running
-                    .get_mut(&dataflow_id)
-                    .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"));
-                let (reply, future) = match dataflow {
-                    Ok(dataflow) => {
-                        let future = dataflow.stop_all(
-                            &mut self.coordinator_connection,
-                            &self.clock,
-                            grace_duration,
-                            force,
-                            &mut logger,
-                        );
-                        (Ok(()), Some(future))
+                let finish_when = {
+                    let mut logger = self.logger.for_dataflow(dataflow_id);
+                    let dataflow = self
+                        .running
+                        .get_mut(&dataflow_id)
+                        .wrap_err_with(|| format!("no running dataflow with ID `{dataflow_id}`"));
+                    let (reply, future) = match dataflow {
+                        Ok(dataflow) => {
+                            let future = dataflow.stop_all(
+                                &mut self.coordinator_connection,
+                                &self.clock,
+                                grace_duration,
+                                force,
+                                &mut logger,
+                            );
+                            (Ok(()), Some(future))
+                        }
+                        Err(err) => (Err(err.to_string()), None),
+                    };
+
+                    let _ = reply_tx
+                        .send(Some(DaemonCoordinatorReply::StopResult(reply)))
+                        .map_err(|_| {
+                            error!("could not send stop reply from daemon to coordinator")
+                        });
+
+                    if let Some(future) = future {
+                        Some(future.await?)
+                    } else {
+                        None
                     }
-                    Err(err) => (Err(err.to_string()), None),
                 };
 
-                let _ = reply_tx
-                    .send(Some(DaemonCoordinatorReply::StopResult(reply)))
-                    .map_err(|_| error!("could not send stop reply from daemon to coordinator"));
-
-                if let Some(future) = future {
-                    future.await?;
+                // If stop_all returns Now, finish the dataflow immediately
+                if matches!(finish_when, Some(FinishDataflowWhen::Now)) {
+                    self.finish_dataflow(dataflow_id).await?;
                 }
 
                 RunStatus::Continue
@@ -855,6 +962,99 @@ impl Daemon {
             }
         };
         Ok(status)
+    }
+
+    async fn collect_and_send_metrics(&mut self) -> eyre::Result<()> {
+        use dora_message::daemon_to_coordinator::NodeMetrics;
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
+
+        if self.coordinator_connection.is_none() {
+            return Ok(());
+        }
+
+        // Reuse system instance for metrics collection
+        let system = &mut self.metrics_system;
+
+        // Metrics are collected every 2 seconds (metrics_interval)
+        const METRICS_INTERVAL_SECS: f64 = 2.0;
+
+        // Collect metrics for all running dataflows
+        for (dataflow_id, dataflow) in &self.running {
+            let mut metrics = BTreeMap::new();
+
+            // Collect all PIDs for this dataflow
+            let pids: Vec<Pid> = dataflow
+                .running_nodes
+                .values()
+                .filter_map(|node| {
+                    node.pid
+                        .as_ref()
+                        .map(|pid| Pid::from_u32(pid.load(atomic::Ordering::Acquire)))
+                })
+                .collect();
+
+            if !pids.is_empty() {
+                // Refresh process metrics (cpu, memory, disk)
+                let refresh_kind = ProcessRefreshKind::nothing()
+                    .with_cpu()
+                    .with_memory()
+                    .with_disk_usage();
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&pids),
+                    true,
+                    refresh_kind,
+                );
+
+                // Collect metrics for each node
+                for (node_id, running_node) in &dataflow.running_nodes {
+                    if let Some(pid) = running_node.pid.as_ref() {
+                        let pid = pid.load(atomic::Ordering::Acquire);
+                        let sys_pid = Pid::from_u32(pid);
+                        if let Some(process) = system.process(sys_pid) {
+                            let disk_usage = process.disk_usage();
+                            // Divide by metrics_interval to get per-second averages
+                            metrics.insert(
+                                node_id.clone(),
+                                NodeMetrics {
+                                    pid,
+                                    cpu_usage: process.cpu_usage(),
+                                    memory_bytes: process.memory(),
+                                    disk_read_bytes: Some(
+                                        (disk_usage.read_bytes as f64 / METRICS_INTERVAL_SECS)
+                                            as u64,
+                                    ),
+                                    disk_write_bytes: Some(
+                                        (disk_usage.written_bytes as f64 / METRICS_INTERVAL_SECS)
+                                            as u64,
+                                    ),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Send metrics to coordinator if we have any
+            if !metrics.is_empty() {
+                if let Some(connection) = &mut self.coordinator_connection {
+                    let msg = serde_json::to_vec(&Timestamped {
+                        inner: CoordinatorRequest::Event {
+                            daemon_id: self.daemon_id.clone(),
+                            event: DaemonEvent::NodeMetrics {
+                                dataflow_id: *dataflow_id,
+                                metrics,
+                            },
+                        },
+                        timestamp: self.clock.new_timestamp(),
+                    })?;
+                    socket_stream_send(connection, &msg)
+                        .await
+                        .wrap_err("failed to send metrics to coordinator")?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_inter_daemon_event(&mut self, event: InterDaemonEvent) -> eyre::Result<()> {
@@ -1041,6 +1241,7 @@ impl Daemon {
         dataflow_descriptor: Descriptor,
         spawn_nodes: BTreeSet<NodeId>,
         uv: bool,
+        write_events_to: Option<PathBuf>,
     ) -> eyre::Result<impl Future<Output = eyre::Result<()>> + use<>> {
         let mut logger = self
             .logger
@@ -1048,8 +1249,11 @@ impl Daemon {
             .try_clone()
             .await
             .context("failed to clone logger")?;
-        let dataflow =
-            RunningDataflow::new(dataflow_id, self.daemon_id.clone(), &dataflow_descriptor);
+        let dataflow = RunningDataflow::new(
+            dataflow_id,
+            self.daemon_id.clone(),
+            dataflow_descriptor.clone(),
+        );
         let dataflow = match self.running.entry(dataflow_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 self.working_dir
@@ -1141,7 +1345,7 @@ impl Daemon {
                 let node_stderr_most_recent = dataflow
                     .node_stderr_most_recent
                     .entry(node.id.clone())
-                    .or_insert_with(|| Arc::new(ArrayQueue::new(STDERR_LOG_LINES)))
+                    .or_insert_with(|| Arc::new(ArrayQueue::new(STDERR_LOG_LINES_MAX)))
                     .clone();
 
                 let configured_node_working_dir = node_working_dirs.get(&node_id).cloned();
@@ -1160,9 +1364,18 @@ impl Daemon {
                     })
                     .unwrap_or(base_working_dir.clone())
                     .clone();
+                let node_write_events_to = write_events_to
+                    .as_ref()
+                    .map(|p| p.join(format!("inputs-{}.json", node.id)));
                 match spawner
                     .clone()
-                    .spawn_node(node, node_working_dir, node_stderr_most_recent, &mut logger)
+                    .spawn_node(
+                        node,
+                        node_working_dir,
+                        node_stderr_most_recent,
+                        node_write_events_to,
+                        &mut logger,
+                    )
                     .await
                     .wrap_err_with(|| format!("failed to spawn node `{node_id}`"))
                 {
@@ -1351,8 +1564,13 @@ impl Daemon {
             for node in prepared_nodes {
                 let node_id = node.node_id().clone();
                 let dynamic_node = node.dynamic();
-                let mut logger = logger.reborrow().for_node(node_id.clone());
-                let result = node.spawn(&mut logger).await;
+                let logger = logger
+                    .reborrow()
+                    .for_node(node_id.clone())
+                    .try_clone()
+                    .await
+                    .context("failed to clone NodeLogger")?;
+                let result = node.spawn(logger).await;
                 let node_spawn_result = match result {
                     Ok(node) => Ok(node),
                     Err(err) => {
@@ -1445,6 +1663,15 @@ impl Daemon {
         dataflow_id: DataflowId,
         node_id: NodeId,
     ) -> eyre::Result<()> {
+        let might_restart = || {
+            let dataflow = self.running.get(&dataflow_id)?;
+            let node = dataflow.running_nodes.get(&node_id)?;
+            Some(match node.restart_policy {
+                RestartPolicy::Never => false,
+                _ if node.restarts_disabled() => false,
+                RestartPolicy::OnFailure | RestartPolicy::Always => true,
+            })
+        };
         match event {
             DaemonNodeEvent::Subscribe {
                 event_sender,
@@ -1483,7 +1710,7 @@ impl Daemon {
                             )
                             .await?;
                         match status {
-                            DataflowStatus::AllNodesReady => {
+                            DataflowStatus::AllNodesReady if !dataflow.dataflow_started => {
                                 logger
                                     .log(
                                         LogLevel::Info,
@@ -1493,8 +1720,9 @@ impl Daemon {
                                     )
                                     .await;
                                 dataflow.start(&self.events_tx, &self.clock).await?;
+                                dataflow.dataflow_started = true;
                             }
-                            DataflowStatus::Pending => {}
+                            _ => {}
                         }
                     }
                 }
@@ -1519,17 +1747,32 @@ impl Daemon {
                 outputs,
                 reply_sender,
             } => {
-                // notify downstream nodes
-                let inner = async {
-                    self.send_output_closed_events(dataflow_id, node_id, outputs)
-                        .await
-                };
+                let reply = if might_restart().unwrap_or(false) {
+                    self.logger
+                        .for_dataflow(dataflow_id)
+                        .for_node(node_id.clone())
+                        .log(
+                            LogLevel::Debug,
+                            Some("daemon".into()),
+                            "skipping CloseOutputs because node might restart",
+                        )
+                        .await;
+                    Ok(())
+                } else {
+                    // notify downstream nodes
+                    let inner = async {
+                        self.send_output_closed_events(dataflow_id, node_id, outputs)
+                            .await
+                    };
 
-                let reply = inner.await.map_err(|err| format!("{err:?}"));
+                    inner.await.map_err(|err| format!("{err:?}"))
+                };
                 let _ = reply_sender.send(DaemonReply::Result(reply));
             }
             DaemonNodeEvent::OutputsDone { reply_sender } => {
-                let result = self.handle_outputs_done(dataflow_id, &node_id).await;
+                let result = self
+                    .handle_outputs_done(dataflow_id, &node_id, might_restart().unwrap_or(false))
+                    .await;
 
                 let _ = reply_sender.send(DaemonReply::Result(
                     result.map_err(|err| format!("{err:?}")),
@@ -1759,12 +2002,24 @@ impl Daemon {
             );
         }
         if dataflow.open_inputs(&node_id).is_empty() {
-            let _ = send_with_timestamp(&event_sender, NodeEvent::AllInputsClosed, clock);
+            if let Some(node) = dataflow.running_nodes.get_mut(&node_id) {
+                node.disable_restart();
+            }
+            if let Some(node) = dataflow.descriptor.nodes.iter().find(|n| n.id == node_id) {
+                if node.inputs.is_empty() {
+                    // do not send AllInputsClosed for source nodes
+                } else {
+                    let _ = send_with_timestamp(&event_sender, NodeEvent::AllInputsClosed, clock);
+                }
+            }
         }
 
         // if a stop event was already sent for the dataflow, send it to
         // the newly connected node too
         if dataflow.stop_sent {
+            if let Some(node) = dataflow.running_nodes.get_mut(&node_id) {
+                node.disable_restart();
+            }
             let _ = send_with_timestamp(&event_sender, NodeEvent::Stop, clock);
         }
 
@@ -1776,6 +2031,7 @@ impl Daemon {
         &mut self,
         dataflow_id: DataflowId,
         node_id: &NodeId,
+        might_restart: bool,
     ) -> eyre::Result<()> {
         let dataflow = self
             .running
@@ -1789,8 +2045,21 @@ impl Daemon {
             .map(|m| &m.1)
             .cloned()
             .collect();
-        self.send_output_closed_events(dataflow_id, node_id.clone(), outputs)
-            .await?;
+
+        if might_restart {
+            self.logger
+                .for_dataflow(dataflow_id)
+                .for_node(node_id.clone())
+                .log(
+                    LogLevel::Debug,
+                    Some("daemon".into()),
+                    "keeping outputs open because node might restart",
+                )
+                .await;
+        } else {
+            self.send_output_closed_events(dataflow_id, node_id.clone(), outputs)
+                .await?;
+        }
 
         let dataflow = self
             .running
@@ -1855,60 +2124,84 @@ impl Daemon {
             )
             .await?;
 
-        self.handle_outputs_done(dataflow_id, node_id).await?;
+        // node only reaches here if it will not be restarted
+        let might_restart = false;
 
-        let mut logger = self.logger.for_dataflow(dataflow_id);
-        let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
-            format!("failed to get downstream nodes: no running dataflow with ID `{dataflow_id}`")
-        })?;
-        dataflow.running_nodes.remove(node_id);
-        if !dataflow.pending_nodes.local_nodes_pending()
-            && dataflow
-                .running_nodes
-                .iter()
-                .all(|(_id, n)| n.node_config.dynamic)
-        {
-            let result = DataflowDaemonResult {
-                timestamp: self.clock.new_timestamp(),
-                node_results: self
-                    .dataflow_node_results
-                    .get(&dataflow.id)
-                    .context("failed to get dataflow node results")?
-                    .clone(),
-            };
+        self.handle_outputs_done(dataflow_id, node_id, might_restart)
+            .await?;
 
-            self.git_manager
-                .clones_in_use
-                .values_mut()
-                .for_each(|dataflows| {
-                    dataflows.remove(&dataflow_id);
-                });
-
-            logger
-                .log(
-                    LogLevel::Info,
-                    None,
-                    Some("daemon".into()),
-                    format!("dataflow finished on machine `{}`", self.daemon_id),
+        let should_finish = {
+            let dataflow = self.running.get_mut(&dataflow_id).wrap_err_with(|| {
+                format!(
+                    "failed to get downstream nodes: no running dataflow with ID `{dataflow_id}`"
                 )
-                .await;
-            if let Some(connection) = &mut self.coordinator_connection {
-                let msg = serde_json::to_vec(&Timestamped {
-                    inner: CoordinatorRequest::Event {
-                        daemon_id: self.daemon_id.clone(),
-                        event: DaemonEvent::AllNodesFinished {
-                            dataflow_id,
-                            result,
-                        },
-                    },
-                    timestamp: self.clock.new_timestamp(),
-                })?;
-                socket_stream_send(connection, &msg)
-                    .await
-                    .wrap_err("failed to report dataflow finish to dora-coordinator")?;
-            }
-            self.running.remove(&dataflow_id);
+            })?;
+            dataflow.running_nodes.remove(node_id);
+            // Check if all remaining nodes are dynamic (won't send SpawnedNodeResult)
+            !dataflow.pending_nodes.local_nodes_pending()
+                && dataflow
+                    .running_nodes
+                    .iter()
+                    .all(|(_id, n)| n.node_config.dynamic)
+        };
+
+        if should_finish {
+            self.finish_dataflow(dataflow_id).await?;
         }
+
+        Ok(())
+    }
+
+    /// Mark a dataflow as finished and perform cleanup.
+    /// This should be called when:
+    /// - `stop_all()` returns `FinishDataflowWhen::Now`, or
+    /// - All non-dynamic nodes have sent `SpawnedNodeResult` events
+    async fn finish_dataflow(&mut self, dataflow_id: Uuid) -> eyre::Result<()> {
+        let mut logger = self.logger.for_dataflow(dataflow_id);
+
+        // Dynamic nodes don't send SpawnedNodeResult events, so there may be no entry
+        // in dataflow_node_results. An empty map means all dynamic nodes handled stop successfully.
+        let result = DataflowDaemonResult {
+            timestamp: self.clock.new_timestamp(),
+            node_results: self
+                .dataflow_node_results
+                .get(&dataflow_id)
+                .cloned()
+                .unwrap_or_default(),
+        };
+
+        self.git_manager
+            .clones_in_use
+            .values_mut()
+            .for_each(|dataflows| {
+                dataflows.remove(&dataflow_id);
+            });
+
+        logger
+            .log(
+                LogLevel::Info,
+                None,
+                Some("daemon".into()),
+                format!("dataflow finished on machine `{}`", self.daemon_id),
+            )
+            .await;
+
+        if let Some(connection) = &mut self.coordinator_connection {
+            let msg = serde_json::to_vec(&Timestamped {
+                inner: CoordinatorRequest::Event {
+                    daemon_id: self.daemon_id.clone(),
+                    event: DaemonEvent::AllNodesFinished {
+                        dataflow_id,
+                        result,
+                    },
+                },
+                timestamp: self.clock.new_timestamp(),
+            })?;
+            socket_stream_send(connection, &msg)
+                .await
+                .wrap_err("failed to report dataflow finish to dora-coordinator")?;
+        }
+        self.running.remove(&dataflow_id);
 
         Ok(())
     }
@@ -2007,6 +2300,7 @@ impl Daemon {
                 node_id,
                 dynamic_node,
                 exit_status,
+                restart,
             } => {
                 let mut logger = self
                     .logger
@@ -2016,7 +2310,7 @@ impl Daemon {
                     .log(
                         LogLevel::Debug,
                         Some("daemon".into()),
-                        format!("handling node stop with exit status {exit_status:?}"),
+                        format!("handling node stop with exit status {exit_status:?} (restart: {restart})"),
                     )
                     .await;
 
@@ -2050,16 +2344,16 @@ impl Daemon {
                                 let cause = dataflow
                                     .and_then(|d| d.node_stderr_most_recent.get(&node_id))
                                     .map(|queue| {
-                                        let mut s = if queue.is_full() {
-                                            "[...]".into()
-                                        } else {
-                                            String::new()
-                                        };
-                                        while let Some(line) = queue.pop() {
-                                            s += &line;
+                                        let mut lines = Vec::new();
+                                        if queue.is_full() {
+                                            lines.push("[...]".into());
                                         }
-                                        s
+                                        while let Some(line) = queue.pop() {
+                                            lines.push(line);
+                                        }
+                                        lines
                                     })
+                                    .map(extract_err_from_stderr)
                                     .unwrap_or_default();
 
                                 NodeErrorCause::Other { stderr: cause }
@@ -2088,13 +2382,23 @@ impl Daemon {
                     )
                     .await;
 
-                self.dataflow_node_results
-                    .entry(dataflow_id)
-                    .or_default()
-                    .insert(node_id.clone(), node_result);
+                if restart {
+                    logger
+                        .log(
+                            LogLevel::Info,
+                            Some("daemon".into()),
+                            "node will be restarted",
+                        )
+                        .await;
+                } else {
+                    self.dataflow_node_results
+                        .entry(dataflow_id)
+                        .or_default()
+                        .insert(node_id.clone(), node_result);
 
-                self.handle_node_stop(dataflow_id, &node_id, dynamic_node)
-                    .await?;
+                    self.handle_node_stop(dataflow_id, &node_id, dynamic_node)
+                        .await?;
+                }
             }
         }
         Ok(())
@@ -2335,6 +2639,9 @@ fn close_input(
         );
 
         if dataflow.open_inputs(receiver_id).is_empty() {
+            if let Some(node) = dataflow.running_nodes.get_mut(receiver_id) {
+                node.disable_restart();
+            }
             let _ = send_with_timestamp(channel, NodeEvent::AllInputsClosed, clock);
         }
     }
@@ -2344,6 +2651,23 @@ fn close_input(
 pub struct RunningNode {
     process: Option<ProcessHandle>,
     node_config: NodeConfig,
+    pid: Option<Arc<AtomicU32>>,
+    restart_policy: RestartPolicy,
+    /// Don't restart the node even if the restart policy says so.
+    ///
+    /// This flag is set when all inputs of the node were closed and when a manual stop command
+    /// was sent.
+    disable_restart: Arc<AtomicBool>,
+}
+
+impl RunningNode {
+    pub fn restarts_disabled(&self) -> bool {
+        self.disable_restart.load(atomic::Ordering::Acquire)
+    }
+
+    pub fn disable_restart(&mut self) {
+        self.disable_restart.store(true, atomic::Ordering::Release);
+    }
 }
 
 #[derive(Debug)]
@@ -2419,8 +2743,13 @@ impl Drop for ProcessHandle {
 
 pub struct RunningDataflow {
     id: Uuid,
+
+    descriptor: Descriptor,
+
     /// Local nodes that are not started yet
     pending_nodes: PendingNodes,
+
+    dataflow_started: bool,
 
     subscribe_channels: HashMap<NodeId, UnboundedSender<Timestamped<NodeEvent>>>,
     drop_channels: HashMap<NodeId, UnboundedSender<Timestamped<NodeDropEvent>>>,
@@ -2461,16 +2790,27 @@ pub struct RunningDataflow {
     publish_all_messages_to_zenoh: bool,
 }
 
+/// Indicates whether a dataflow should be finished immediately after stop_all()
+/// or whether to wait for SpawnedNodeResult events from running nodes.
+#[must_use]
+pub enum FinishDataflowWhen {
+    /// Finish the dataflow immediately (all nodes are dynamic or no nodes running)
+    Now,
+    /// Wait for SpawnedNodeResult events from non-dynamic nodes
+    WaitForNodes,
+}
+
 impl RunningDataflow {
     fn new(
         dataflow_id: Uuid,
         daemon_id: DaemonId,
-        dataflow_descriptor: &Descriptor,
+        dataflow_descriptor: Descriptor,
     ) -> RunningDataflow {
         let (finished_tx, _) = broadcast::channel(1);
         Self {
             id: dataflow_id,
             pending_nodes: PendingNodes::new(dataflow_id, daemon_id),
+            dataflow_started: false,
             subscribe_channels: HashMap::new(),
             drop_channels: HashMap::new(),
             mappings: HashMap::new(),
@@ -2489,6 +2829,7 @@ impl RunningDataflow {
             publishers: Default::default(),
             finished_tx,
             publish_all_messages_to_zenoh: dataflow_descriptor.debug.publish_all_messages_to_zenoh,
+            descriptor: dataflow_descriptor,
         }
     }
 
@@ -2557,7 +2898,7 @@ impl RunningDataflow {
         grace_duration: Option<Duration>,
         force: bool,
         logger: &mut DataflowLogger<'_>,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<FinishDataflowWhen> {
         self.pending_nodes
             .handle_dataflow_stop(
                 coordinator_connection,
@@ -2567,6 +2908,10 @@ impl RunningDataflow {
                 logger,
             )
             .await?;
+
+        for node in self.running_nodes.values_mut() {
+            node.disable_restart();
+        }
 
         for (_node_id, channel) in self.subscribe_channels.drain() {
             let _ = send_with_timestamp(&channel, NodeEvent::Stop, clock);
@@ -2614,7 +2959,30 @@ impl RunningDataflow {
             });
         }
         self.stop_sent = true;
-        Ok(())
+
+        // Determine if we should finish immediately or wait for nodes
+        Ok(self.should_finish_immediately())
+    }
+
+    /// Check if dataflow should finish immediately after stop_all().
+    /// Returns `Now` if all running nodes are dynamic (they won't send SpawnedNodeResult).
+    /// Returns `WaitForNodes` if there are non-dynamic nodes to wait for.
+    fn should_finish_immediately(&self) -> FinishDataflowWhen {
+        // Only finish immediately if:
+        // 1. No pending nodes
+        // 2. All running nodes are dynamic (they won't send SpawnedNodeResult)
+        // 3. Stop was sent (stop_all() was called)
+        if !self.pending_nodes.local_nodes_pending()
+            && self
+                .running_nodes
+                .iter()
+                .all(|(_id, n)| n.node_config.dynamic)
+            && self.stop_sent
+        {
+            FinishDataflowWhen::Now
+        } else {
+            FinishDataflowWhen::WaitForNodes
+        }
     }
 
     fn open_inputs(&self, node_id: &NodeId) -> &BTreeSet<DataId> {
@@ -2690,7 +3058,9 @@ pub enum Event {
     Dora(DoraEvent),
     DynamicNode(DynamicNodeEventWrapper),
     HeartbeatInterval,
+    MetricsInterval,
     CtrlC,
+    StopAfter(Duration),
     SecondCtrlC,
     DaemonError(eyre::Report),
     SpawnNodeResult {
@@ -2729,7 +3099,9 @@ impl Event {
             Event::Dora(_) => "Dora",
             Event::DynamicNode(_) => "DynamicNode",
             Event::HeartbeatInterval => "HeartbeatInterval",
+            Event::MetricsInterval => "MetricsInterval",
             Event::CtrlC => "CtrlC",
+            Event::StopAfter(_) => "StopAfter",
             Event::SecondCtrlC => "SecondCtrlC",
             Event::DaemonError(_) => "DaemonError",
             Event::SpawnNodeResult { .. } => "SpawnNodeResult",
@@ -2789,6 +3161,8 @@ pub enum DoraEvent {
         node_id: NodeId,
         dynamic_node: bool,
         exit_status: NodeExitStatus,
+        /// Whether the node will be restarted
+        restart: bool,
     },
 }
 
